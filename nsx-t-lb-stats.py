@@ -94,7 +94,6 @@ def main():
     desired_collection_days=1
     execution_interval=5
    
-    
     itterations=int(desired_collection_days*24*60*60/execution_interval)
     
     vs_list = []
