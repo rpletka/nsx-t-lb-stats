@@ -107,7 +107,7 @@ def main():
     
     #Setup the total stats file.  This file has the sum of all the stats along with a date stamp.  This is written out as a csv so you can easily sort to find the peak of each value.
     total_stats_file = open("./total-stats.csv", "w")
-    fieldnames=["timestamp", "lb_count", "vs_count", "cps", "l4_bytes", "tps", "rps","ssl_bytes"]
+    fieldnames=["timestamp", "lb_count", "vs_count", "cps", "byteRate", "tps", "rps"]
     total_stats_writer = csv.DictWriter(total_stats_file, fieldnames=fieldnames)
     total_stats_writer.writeheader()
 
@@ -123,7 +123,7 @@ def main():
         lb_count = len(lb_json["results"])
 
         #initialize the total stats
-        total_stats={"timestamp":str(datetime.now()),"lb_count":lb_count,"vs_count":0,"cps":0,"l4_bytes":0,"tps":0,"rps":0,"ssl_bytes":0}
+        total_stats={"timestamp":str(datetime.now()),"lb_count":lb_count,"vs_count":0,"cps":0,"byteRate":0,"tps":0,"rps":0}
 
         #Loop through the load balancers
         for lb in range(0,lb_count):
@@ -142,48 +142,61 @@ def main():
             for vs in range(0,vs_count):
                 
                 #if the virtual server doesn't already exist then lookup vs_id and check if it is configured for SSL
+                #print("Procssing {0}\n\n".format(vs_stats_json[vs]["virtual_server_path"]))
                 row=checkKeyValuePairInList(vs_list,'virtual_server_path',vs_stats_json[vs]["virtual_server_path"])
                 if row == -1:
                     #Get the config for the virtual server vs_id and determine if it is terminating ssl based on the existance of a client_ssl_profile_binding
                     upath = "/policy/api/v1" + vs_stats_json[vs]["virtual_server_path"]
                     vs_json = s.get(nsx_mgr + upath).json()
+                    #Get the application profile to determine if the VS is L4 or L7
+                    upath = "/policy/api/v1" + vs_json["application_profile_path"]
+                    app_profile_json = s.get(nsx_mgr + upath).json()
+                    if app_profile_json["resource_type"] == 'LBHttpProfile':
+                        is_L7 = True
+                    else:
+                        is_L7 = False
                     vs_id = vs_json["id"]
                     is_SSL = is_json_key_present(vs_json, "client_ssl_profile_binding")
                 else:
                     #Otherwise use the values in the vs_list for the row
+                    is_L7=vs_list[row]["is_L7"]
                     is_SSL=vs_list[row]["is_SSL"]
                     vs_id=vs_list[row]["vs_id"]
 
                 #Initialize the statistics
-                cps=0;l4_bytes=0;tps=0;ssl_bytes=0;rps=0
+                cps=0;byteRate=0;tps=0;rps=0
 
+                #print(vs_stats_json[vs])
                 #use the current stats rate to populate the metrics based on if this is SSL or non SSL. 
-                l4_bytes=vs_stats_json[vs]["statistics"]["bytes_in_rate"] + vs_stats_json[vs]["statistics"]["bytes_out_rate"]
-                cps=vs_stats_json[vs]["statistics"]["http_request_rate"]            
+                
+                if is_L7:
+                    cps=vs_stats_json[vs]["statistics"]["http_request_rate"]
+                    byteRate=vs_stats_json[vs]["statistics"]["bytes_in_rate"] + vs_stats_json[vs]["statistics"]["bytes_out_rate"]
+                    rps = vs_stats_json[vs]["statistics"]["http_request_rate"] 
+                else:
+                    #Unfortuantely the only rate we have for L4 VS is CPS
+                    cps=vs_stats_json[vs]["statistics"]["current_session_rate"]
                 if is_SSL :
-                    ssl_bytes = vs_stats_json[vs]["statistics"]["bytes_in_rate"] + vs_stats_json[vs]["statistics"]["bytes_out_rate"]
                     tps = vs_stats_json[vs]["statistics"]["current_session_rate"]
-                    rps = vs_stats_json[vs]["statistics"]["http_request_rate"]
+                    
                 
                 #Update total stats
                 total_stats["cps"]+= cps
-                total_stats["l4_bytes"]+= l4_bytes
+                total_stats["byteRate"]+= byteRate
                 total_stats["tps"]+= tps
                 total_stats["rps"]+= rps
-                total_stats["ssl_bytes"]+= ssl_bytes
 
                 #if the virtual server didn't exist in vs_list then append it to the list.  If it did exist check each new stat and keep the peak stat.
                 if row == -1:
                     #Build the stats json
-                    statistcs={'cps': cps,'l4_bytes': l4_bytes,'tps': tps,'rps': rps,'ssl_bytes': ssl_bytes}
-                    vs_stats={"virtual_server_path":vs_stats_json[vs]["virtual_server_path"],'vs_id': vs_id,'is_SSL':is_SSL,'statistics':statistcs}    
+                    statistcs={'cps': cps,'byteRate': byteRate,'tps': tps,'rps': rps}
+                    vs_stats={"virtual_server_path":vs_stats_json[vs]["virtual_server_path"],'vs_id': vs_id, 'is_L7':is_L7, 'is_SSL':is_SSL,'statistics':statistcs}    
                     vs_list.append(vs_stats)
                 else:
                     vs_list[row]["statistics"]["cps"]= checkUpdateStat(cps,vs_list[row]["statistics"]["cps"])
-                    vs_list[row]["statistics"]["l4_bytes"] = checkUpdateStat(l4_bytes,vs_list[row]["statistics"]["l4_bytes"])
+                    vs_list[row]["statistics"]["byteRate"] = checkUpdateStat(byteRate,vs_list[row]["statistics"]["byteRate"])
                     vs_list[row]["statistics"]["tps"] = checkUpdateStat(tps,vs_list[row]["statistics"]["tps"])
                     vs_list[row]["statistics"]["rps"] = checkUpdateStat(rps,vs_list[row]["statistics"]["rps"])
-                    vs_list[row]["statistics"]["ssl_bytes"] = checkUpdateStat(ssl_bytes,vs_list[row]["statistics"]["ssl_bytes"])
                     #print(vs_list[row])
         
         #After looping through all the load balancers and virtual servers append the total stats with a timestamp. 
@@ -196,14 +209,13 @@ def main():
         peak_stats_file = open("./peak-stats-per-vs.txt", "w")
         vsCount=len(vs_list)
         peak_stats_file.write(start_message + "This file contains the peak value of each metric observed on each virtual service at any sample period. \n")
-        total_cps=0;total_l4_bytes=0;total_tps=0;total_rps=0;total_ssl_bytes=0
+        total_cps=0;total_bytes=0;total_tps=0;total_rps=0
         for row in range(0,vsCount):
             peak_stats_file.write(json.dumps(vs_list[row]) + "\n")
             total_cps += vs_list[row]["statistics"]["cps"]
-            total_l4_bytes += vs_list[row]["statistics"]["l4_bytes"]
+            total_bytes += vs_list[row]["statistics"]["byteRate"]
             total_tps += vs_list[row]["statistics"]["tps"]
             total_rps += vs_list[row]["statistics"]["rps"]
-            total_ssl_bytes += vs_list[row]["statistics"]["ssl_bytes"]
         peak_stats_file.write("Summary Peak Virtual Server Stats {0} hours.\n".format(execution_interval*itterations/60/60))
         peak_stats_file.close()
         time.sleep(execution_interval)
